@@ -11,9 +11,8 @@
     </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
-    <ProjectGuid>{35A58019-C8B8-47EF-8D24-ADADFB838ED0}</ProjectGuid>
-    <RootNamespace>__CUDA__SPHINCS__latency_oriented_version</RootNamespace>
-    <ProjectName>Security_Level_1</ProjectName>
+    <ProjectGuid>{8ACA8266-F5EC-4684-AC5B-CA6261E3B320}</ProjectGuid>
+    <RootNamespace>Security_Level_5</RootNamespace>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">

@@ -726,27 +726,26 @@ __device__ void wots_gen_leaf(uint8_t* leaf, uint8_t* sk_seed, uint8_t* pub_seed
     wots_gen_leaf_thash(leaf, pk, pub_seed, state_seed, wots_pk_addr);
 }
 
-//! FORS signature
 __global__ void fors_sign_latency(uint8_t* sig, uint8_t* roots, uint32_t* indices, uint8_t* sk_seed, uint8_t* pub_seed, uint32_t fors_addr[8], uint8_t* state_seed, uint32_t* lengths) {
-    __shared__ uint8_t shared_stack[SPX_N * (1 << SPX_FORS_HEIGHT)];
+
+    __shared__ uint8_t shared_stack[SPX_N * (1 << (SPX_FORS_HEIGHT - 1))];
     uint8_t iternal_pub_seed[SPX_PK_BYTES] = { 0, };
     uint8_t iternal_sk_seed[SPX_SK_BYTES] = { 0, };
     uint8_t iternal_state_seed[SPX_SHA256_OUTPUT_BYTES + 8] = { 0, };
-
+    uint8_t root[SPX_N] = { 0, };
+    uint8_t stack[SPX_N * 2];
     uint32_t fors_tree_addr[8] = { 0, };
     uint32_t fors_pk_addr[8] = { 0, };
     uint32_t idx_offset = 0;
     uint32_t tree_idx = 0;
     uint32_t leaf_idx = indices[blockIdx.x];
     uint32_t sig_index = (SPX_N * (SPX_FORS_HEIGHT + 1)) * blockIdx.x;
-
     for (int i = 0; i < SPX_PK_BYTES; i++)
         iternal_pub_seed[i] = pub_seed[i];
     for (int i = 0; i < SPX_SK_BYTES; i++)
         iternal_sk_seed[i] = sk_seed[i];
     for (int i = 0; i < SPX_SHA256_OUTPUT_BYTES + 8; i++)
         iternal_state_seed[i] = state_seed[i];
-    __syncthreads();
 
     copy_keypair_addr(fors_tree_addr, fors_addr);
     copy_keypair_addr(fors_pk_addr, fors_addr);
@@ -761,109 +760,118 @@ __global__ void fors_sign_latency(uint8_t* sig, uint8_t* roots, uint32_t* indice
         fors_gen_sk(sig + sig_index, iternal_sk_seed, fors_tree_addr);
     }
 
-    //! leaf node generation
-    fors_gen_leaf(shared_stack + (SPX_N * threadIdx.x), iternal_sk_seed, iternal_pub_seed, threadIdx.x + idx_offset, fors_tree_addr, iternal_state_seed);
-    if ((leaf_idx ^ 0x1) == threadIdx.x)
-        memcpy(sig + SPX_N + sig_index, shared_stack + (SPX_N * threadIdx.x), SPX_N);
-    __syncthreads();
-
-    //! merging process [256 Node   -> 128 Node]
-    if (threadIdx.x < 128) {
-        set_tree_height(fors_tree_addr, 1);
-        set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 1));
-        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (2 * SPX_N * threadIdx.x),
-            shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
-        if (((leaf_idx >> 1) ^ 0x1) == threadIdx.x)
-            memcpy(sig + (2 * SPX_N) + sig_index, shared_stack + (2 * SPX_N * threadIdx.x), SPX_N);
+    //LEAF GEN
+    fors_gen_leaf(stack, iternal_sk_seed, iternal_pub_seed, 2 * threadIdx.x + idx_offset, fors_tree_addr, iternal_state_seed);
+    fors_gen_leaf(stack + SPX_N, iternal_sk_seed, iternal_pub_seed, 2 * threadIdx.x + 1 + idx_offset, fors_tree_addr, iternal_state_seed);
+    if ((leaf_idx ^ 0x1) == 2 * threadIdx.x) {
+        memcpy(sig + SPX_N + sig_index, stack, SPX_N);
     }
+    else if ((leaf_idx ^ 0x1) == (2 * threadIdx.x + 1)) {
+        memcpy(sig + SPX_N + sig_index, stack + SPX_N, SPX_N);
+    }
+    //FORS Depth 1 [512->256]
+    set_tree_height(fors_tree_addr, 1);
+    set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 1));
+    tree_thash_2depth(shared_stack + (SPX_N * threadIdx.x), stack, stack + SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
+    if (((leaf_idx >> 1) ^ 0x1) == threadIdx.x)
+        memcpy(sig + 2 * SPX_N + sig_index, shared_stack + (SPX_N * threadIdx.x), SPX_N);
     __syncthreads();
 
-    //! merging process [128 Node   -> 64 Node]
-    if (threadIdx.x < 64) {
+    //FORS Depth [256->128]
+    if (threadIdx.x < 128) {
         set_tree_height(fors_tree_addr, 2);
         set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 2));
-        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, shared_stack + (4 * SPX_N * threadIdx.x),
-            shared_stack + (4 * SPX_N * threadIdx.x) + 2 * SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
+        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N,
+            iternal_pub_seed, fors_tree_addr, iternal_state_seed);
         if (((leaf_idx >> 2) ^ 0x1) == threadIdx.x)
-            memcpy(sig + (3 * SPX_N) + sig_index, shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, SPX_N);
+            memcpy(sig + 3 * SPX_N + sig_index, shared_stack + (2 * SPX_N * threadIdx.x), SPX_N);
     }
     __syncthreads();
 
-    //! merging process [64 Node    -> 32 Node]
-    if (threadIdx.x < 32) {
+    //FORS Depth [128->64]
+    if (threadIdx.x < 64) {
         set_tree_height(fors_tree_addr, 3);
         set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 3));
-        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (4 * SPX_N * threadIdx.x) + SPX_N,
-            shared_stack + (4 * SPX_N * threadIdx.x) + 3 * SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
+        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, shared_stack + (4 * SPX_N * threadIdx.x),
+            shared_stack + (4 * SPX_N * threadIdx.x) + 2 * SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
         if (((leaf_idx >> 3) ^ 0x1) == threadIdx.x)
-            memcpy(sig + (4 * SPX_N) + sig_index, shared_stack + (2 * SPX_N * threadIdx.x), SPX_N);
+            memcpy(sig + 4 * SPX_N + sig_index, shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, SPX_N);
     }
     __syncthreads();
 
-    //! merging process [32 Node    -> 16 Node]
-    if (threadIdx.x < 16) {
+    //FORS Depth [64 -> 32]
+    if (threadIdx.x < 32) {
         set_tree_height(fors_tree_addr, 4);
         set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 4));
-        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, shared_stack + (4 * SPX_N * threadIdx.x),
-            shared_stack + (4 * SPX_N * threadIdx.x) + 2 * SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
+        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (4 * SPX_N * threadIdx.x) + SPX_N,
+            shared_stack + (4 * SPX_N * threadIdx.x) + 3 * SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
         if (((leaf_idx >> 4) ^ 0x1) == threadIdx.x)
-            memcpy(sig + (5 * SPX_N) + sig_index, shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, SPX_N);
+            memcpy(sig + 5 * SPX_N + sig_index, shared_stack + (2 * SPX_N * threadIdx.x), SPX_N);
     }
     __syncthreads();
 
-    //! merging process [16 Node    -> 8 Node]
-    if (threadIdx.x < 8) {
+    //FORS Depth [32 -> 16]
+    if (threadIdx.x < 16) {
         set_tree_height(fors_tree_addr, 5);
         set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 5));
-        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (4 * SPX_N * threadIdx.x) + SPX_N,
-            shared_stack + (4 * SPX_N * threadIdx.x) + 3 * SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
-        if (((leaf_idx >> 5) ^ 0x1) == threadIdx.x)
-            memcpy(sig + (6 * SPX_N) + sig_index, shared_stack + (2 * SPX_N * threadIdx.x), SPX_N);
-    }
-    __syncthreads();
-
-    //! merging process [8 Node     -> 4 Node]
-    if (threadIdx.x < 4) {
-        set_tree_height(fors_tree_addr, 6);
-        set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 6));
         tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, shared_stack + (4 * SPX_N * threadIdx.x),
             shared_stack + (4 * SPX_N * threadIdx.x) + 2 * SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
-        if (((leaf_idx >> 6) ^ 0x1) == threadIdx.x)
-            memcpy(sig + (7 * SPX_N) + sig_index, shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, SPX_N);
+        if (((leaf_idx >> 5) ^ 0x1) == threadIdx.x)
+            memcpy(sig + 6 * SPX_N + sig_index, shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, SPX_N);
     }
     __syncthreads();
 
-    //! merging process [4 Node     -> 2 Node]
-    if (threadIdx.x < 2) {
-        set_tree_height(fors_tree_addr, 7);
-        set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 7));
+    //FORS[16 -> 8]
+    if (threadIdx.x < 8) {
+        set_tree_height(fors_tree_addr, 6);
+        set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 6));
         tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (4 * SPX_N * threadIdx.x) + SPX_N,
             shared_stack + (4 * SPX_N * threadIdx.x) + 3 * SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
+        if (((leaf_idx >> 6) ^ 0x1) == threadIdx.x)
+            memcpy(sig + 7 * SPX_N + sig_index, shared_stack + (2 * SPX_N * threadIdx.x), SPX_N);
+    }
+    __syncthreads();
+
+    //FORS Depth [8 -> 4]
+    if (threadIdx.x < 4) {
+        set_tree_height(fors_tree_addr, 7);
+        set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 7));
+        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, shared_stack + (4 * SPX_N * threadIdx.x),
+            shared_stack + (4 * SPX_N * threadIdx.x) + 2 * SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
         if (((leaf_idx >> 7) ^ 0x1) == threadIdx.x)
-            memcpy(sig + (8 * SPX_N) + sig_index, shared_stack + (2 * SPX_N * threadIdx.x), SPX_N);
+            memcpy(sig + 8 * SPX_N + sig_index, shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, SPX_N);
     }
     __syncthreads();
 
-    //! merging process [2 Node     -> 1 Node]
-    if (threadIdx.x == 0) {
+    //FORS[4 -> 2]
+    if (threadIdx.x < 2) {
         set_tree_height(fors_tree_addr, 8);
-        set_tree_index(fors_tree_addr, idx_offset >> 8);
-        tree_thash_2depth(roots + (SPX_N * blockIdx.x), shared_stack, shared_stack + (2 * SPX_N), iternal_pub_seed, fors_tree_addr, iternal_state_seed);
+        set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 8));
+        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (4 * SPX_N * threadIdx.x) + SPX_N,
+            shared_stack + (4 * SPX_N * threadIdx.x) + 3 * SPX_N, iternal_pub_seed, fors_tree_addr, iternal_state_seed);
+        if (((leaf_idx >> 8) ^ 0x1) == threadIdx.x)
+            memcpy(sig + 9 * SPX_N + sig_index, shared_stack + (2 * SPX_N * threadIdx.x), SPX_N);
     }
     __syncthreads();
 
+    if (threadIdx.x == 0) {
+        set_tree_height(fors_tree_addr, 9);
+        set_tree_index(fors_tree_addr, threadIdx.x + (idx_offset >> 9));
+        tree_thash_2depth(roots + (SPX_N * blockIdx.x), shared_stack, shared_stack + 2 * SPX_N, iternal_pub_seed,
+            fors_tree_addr, iternal_state_seed);
+    }
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        uint8_t root[SPX_N];
-        final_thash(root, roots, iternal_pub_seed, fors_pk_addr, iternal_state_seed);
+        final_thash(root, roots, iternal_pub_seed, fors_pk_addr, state_seed);
         chain_lengths(lengths, root);
     }
 }
+//(67 * 4)
 __global__ void MSS_signature(uint32_t* lengths, uint8_t* sig, uint8_t* sk_seed, uint8_t* pub_seed, uint8_t* state_seed, uint32_t* leaf_idx, uint64_t* tree) {
     uint8_t iternal_pub_seed[SPX_PK_BYTES] = { 0, };
     uint8_t iternal_sk_seed[SPX_SK_BYTES] = { 0, };
     uint8_t iternal_state_seed[SPX_SHA256_OUTPUT_BYTES + 8] = { 0, };
     uint8_t sphincs_root[SPX_N];
-    __shared__ uint8_t wots_pk[(1 << SPX_FULL_HEIGHT / SPX_D) * SPX_WOTS_LEN * SPX_N];
+    __shared__ uint8_t wots_pk[4 * SPX_WOTS_LEN * SPX_N];
     __shared__ uint8_t shared_stack[SPX_N * (1 << (SPX_FULL_HEIGHT / SPX_D))];
 
     for (int i = 0; i < SPX_PK_BYTES; i++)
@@ -891,7 +899,7 @@ __global__ void MSS_signature(uint32_t* lengths, uint8_t* sig, uint8_t* sk_seed,
     set_layer_addr(sphincs_tree_addr, blockIdx.x);
     set_tree_addr(sphincs_tree_addr, sphincs_tree);
 
-    //wots_gen_leaf part
+    //!=================[0 to 3]===================!//
     set_type(wots_addr, 0);
     set_type(wots_pk_addr, 1);
 
@@ -904,7 +912,7 @@ __global__ void MSS_signature(uint32_t* lengths, uint8_t* sig, uint8_t* sk_seed,
     gen_chain(wots_pk + SPX_N * threadIdx.x, sphincs_root, 0, SPX_WOTS_W - 1, iternal_pub_seed, iternal_state_seed, wots_addr);
     __syncthreads();
 
-    if (threadIdx.x < 8) {
+    if (threadIdx.x < 4) {
         set_keypair_addr(wots_addr, threadIdx.x + sphincs_idx_offset);
         copy_keypair_addr(wots_pk_addr, wots_addr);
         wots_gen_leaf_thash(shared_stack + SPX_N * threadIdx.x, wots_pk + (SPX_WOTS_LEN * SPX_N * threadIdx.x), pub_seed, state_seed, wots_pk_addr);
@@ -914,8 +922,77 @@ __global__ void MSS_signature(uint32_t* lengths, uint8_t* sig, uint8_t* sk_seed,
     }
     __syncthreads();
 
-    //! merging process [8 Node -> 4 Node]
+    //!=================[4 to 7]===================!//
+    set_type(wots_addr, 0);
+    set_type(wots_pk_addr, 1);
+
+    copy_subtree_addr(wots_addr, sphincs_tree_addr);
+    set_keypair_addr(wots_addr, (threadIdx.x / SPX_WOTS_LEN) + 4);
+
+    //wots_gen_pk part
+    set_chain_addr(wots_addr, threadIdx.x % SPX_WOTS_LEN);
+    wots_gen_sk(sphincs_root, iternal_sk_seed, wots_addr);
+    gen_chain(wots_pk + SPX_N * threadIdx.x, sphincs_root, 0, SPX_WOTS_W - 1, iternal_pub_seed, iternal_state_seed, wots_addr);
+    __syncthreads();
+
     if (threadIdx.x < 4) {
+        set_keypair_addr(wots_addr, threadIdx.x + 4 + sphincs_idx_offset);
+        copy_keypair_addr(wots_pk_addr, wots_addr);
+        wots_gen_leaf_thash(shared_stack + SPX_N * (4 + threadIdx.x), wots_pk + (SPX_WOTS_LEN * SPX_N * threadIdx.x), pub_seed, state_seed, wots_pk_addr);
+        if ((sphincs_leaf_idx ^ 0x1) == (threadIdx.x + 4)) {
+            memcpy(sig + sig_store_index, shared_stack + (SPX_N * (threadIdx.x + 4)), SPX_N);
+        }
+    }
+    __syncthreads();
+
+    //!=================[8 to 11]===================!//
+    set_type(wots_addr, 0);
+    set_type(wots_pk_addr, 1);
+
+    copy_subtree_addr(wots_addr, sphincs_tree_addr);
+    set_keypair_addr(wots_addr, (threadIdx.x / SPX_WOTS_LEN) + 8);
+
+    //wots_gen_pk part
+    set_chain_addr(wots_addr, threadIdx.x % SPX_WOTS_LEN);
+    wots_gen_sk(sphincs_root, iternal_sk_seed, wots_addr);
+    gen_chain(wots_pk + SPX_N * threadIdx.x, sphincs_root, 0, SPX_WOTS_W - 1, iternal_pub_seed, iternal_state_seed, wots_addr);
+    __syncthreads();
+
+    if (threadIdx.x < 4) {
+        set_keypair_addr(wots_addr, threadIdx.x + 8 + sphincs_idx_offset);
+        copy_keypair_addr(wots_pk_addr, wots_addr);
+        wots_gen_leaf_thash(shared_stack + SPX_N * (8 + threadIdx.x), wots_pk + (SPX_WOTS_LEN * SPX_N * threadIdx.x), pub_seed, state_seed, wots_pk_addr);
+        if ((sphincs_leaf_idx ^ 0x1) == (threadIdx.x + 8)) {
+            memcpy(sig + sig_store_index, shared_stack + (SPX_N * (threadIdx.x + 8)), SPX_N);
+        }
+    }
+    __syncthreads();
+
+    //!=================[12 to 15]===================!//
+    set_type(wots_addr, 0);
+    set_type(wots_pk_addr, 1);
+
+    copy_subtree_addr(wots_addr, sphincs_tree_addr);
+    set_keypair_addr(wots_addr, (threadIdx.x / SPX_WOTS_LEN) + 12);
+
+    //wots_gen_pk part
+    set_chain_addr(wots_addr, threadIdx.x % SPX_WOTS_LEN);
+    wots_gen_sk(sphincs_root, iternal_sk_seed, wots_addr);
+    gen_chain(wots_pk + SPX_N * threadIdx.x, sphincs_root, 0, SPX_WOTS_W - 1, iternal_pub_seed, iternal_state_seed, wots_addr);
+    __syncthreads();
+
+    if (threadIdx.x < 4) {
+        set_keypair_addr(wots_addr, threadIdx.x + 12 + sphincs_idx_offset);
+        copy_keypair_addr(wots_pk_addr, wots_addr);
+        wots_gen_leaf_thash(shared_stack + SPX_N * (12 + threadIdx.x), wots_pk + (SPX_WOTS_LEN * SPX_N * threadIdx.x), pub_seed, state_seed, wots_pk_addr);
+        if ((sphincs_leaf_idx ^ 0x1) == (threadIdx.x + 12)) {
+            memcpy(sig + sig_store_index, shared_stack + (SPX_N * (threadIdx.x + 12)), SPX_N);
+        }
+    }
+    __syncthreads();
+
+    //!=================[root generation]===================!//
+    if (threadIdx.x < 8) {
         set_tree_height(sphincs_tree_addr, 1);
         set_tree_index(sphincs_tree_addr, threadIdx.x + (sphincs_idx_offset >> 1));
         tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (2 * SPX_N * threadIdx.x),
@@ -925,8 +1002,7 @@ __global__ void MSS_signature(uint32_t* lengths, uint8_t* sig, uint8_t* sk_seed,
     }
     __syncthreads();
 
-    //! merging process [4 Node -> 2 Node]
-    if (threadIdx.x < 2) {
+    if (threadIdx.x < 4) {
         set_tree_height(sphincs_tree_addr, 2);
         set_tree_index(sphincs_tree_addr, threadIdx.x + (sphincs_idx_offset >> 2));
         tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, shared_stack + (4 * SPX_N * threadIdx.x),
@@ -935,21 +1011,29 @@ __global__ void MSS_signature(uint32_t* lengths, uint8_t* sig, uint8_t* sk_seed,
             memcpy(sig + sig_store_index + 2 * SPX_N, shared_stack + (2 * SPX_N * threadIdx.x + SPX_N), SPX_N);
     }
     __syncthreads();
-
-    //! merging process [2 Node -> 1 Node]
-    if (threadIdx.x == 0) {
+    if (threadIdx.x < 2) {
         set_tree_height(sphincs_tree_addr, 3);
-        set_tree_index(sphincs_tree_addr, (sphincs_idx_offset >> 3));
-        tree_thash_2depth(sphincs_root, shared_stack + SPX_N, shared_stack + (3 * SPX_N), iternal_pub_seed, sphincs_tree_addr, iternal_state_seed);
+        set_tree_index(sphincs_tree_addr, threadIdx.x + (sphincs_idx_offset >> 3));
+        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (4 * SPX_N * threadIdx.x) + SPX_N,
+            shared_stack + (4 * SPX_N * threadIdx.x) + 3 * SPX_N, iternal_pub_seed, sphincs_tree_addr, iternal_state_seed);
+        if (((sphincs_leaf_idx >> 3) ^ 0x1) == threadIdx.x)
+            memcpy(sig + sig_store_index + 3 * SPX_N, shared_stack + (2 * SPX_N * threadIdx.x), SPX_N);
+    }
+
+    if (threadIdx.x == 0) {
+        set_tree_height(sphincs_tree_addr, 4);
+        set_tree_index(sphincs_tree_addr, (sphincs_idx_offset >> 4));
+        tree_thash_2depth(sphincs_root, shared_stack, shared_stack + (2 * SPX_N), iternal_pub_seed, sphincs_tree_addr, iternal_state_seed);
         chain_lengths(lengths + SPX_WOTS_LEN * blockIdx.x, sphincs_root);
     }
+
 }
+
 __global__ void wots_sign(uint8_t* sig, uint32_t* lengths, uint8_t* sk_seed, uint8_t* pub_seed, uint8_t* state_seed, uint32_t* leaf_idx, uint64_t* tree) {
-    uint8_t hash_temp[SPX_SHA256_OUTPUT_BYTES] = { 0, };
-    uint8_t buffer[SPX_SHA256_OUTPUT_BYTES] = { 0, };
+    uint8_t hash_temp[SPX_N];
     uint8_t iternal_pub_seed[SPX_PK_BYTES];
     uint8_t iternal_sk_seed[SPX_SK_BYTES];
-    uint8_t iternal_state_seed[SPX_SHA256_OUTPUT_BYTES + 8];
+    uint8_t iternal_state_seed[40];
     uint32_t sphincs_tree_addr[8] = { 0, };
     uint32_t sphincs_wots_addr[8] = { 0, };
     uint32_t sig_store_index = (blockIdx.x) * (SPX_WOTS_BYTES + SPX_TREE_HEIGHT * SPX_N);
@@ -969,9 +1053,9 @@ __global__ void wots_sign(uint8_t* sig, uint32_t* lengths, uint8_t* sk_seed, uin
         iternal_pub_seed[i] = pub_seed[i];
     for (int i = 0; i < SPX_SK_BYTES; i++)
         iternal_sk_seed[i] = sk_seed[i];
-    for (int i = 0; i < SPX_SHA256_OUTPUT_BYTES + 8; i++)
+    for (int i = 0; i < 40; i++)
         iternal_state_seed[i] = state_seed[i];
-    __syncthreads();
+
     set_type(sphincs_tree_addr, SPX_ADDR_TYPE_HASHTREE);
     set_layer_addr(sphincs_tree_addr, blockIdx.x);
     set_tree_addr(sphincs_tree_addr, sphincs_tree);
@@ -980,10 +1064,163 @@ __global__ void wots_sign(uint8_t* sig, uint32_t* lengths, uint8_t* sk_seed, uin
 
     set_chain_addr(sphincs_wots_addr, threadIdx.x);
     wots_gen_sk(hash_temp, iternal_sk_seed, sphincs_wots_addr);
-    gen_chain(buffer, hash_temp, 0, lengths[(SPX_WOTS_LEN * blockIdx.x) + threadIdx.x], iternal_pub_seed, iternal_state_seed, sphincs_wots_addr);
-    memcpy(sig + sig_store_index + (SPX_N * threadIdx.x), buffer, SPX_N);
-
+    gen_chain(hash_temp, hash_temp, 0, lengths[(SPX_WOTS_LEN * blockIdx.x) + threadIdx.x], iternal_pub_seed, iternal_state_seed, sphincs_wots_addr);
+    memcpy(sig + sig_store_index + (SPX_N * threadIdx.x), hash_temp, SPX_N);
 }
+
+int crypto_sign_signature_security_level_5(uint8_t* sig, size_t* siglen, uint8_t* m, size_t mlen, uint8_t* sk) {
+    uint8_t* sk_seed = sk;
+    uint8_t* sk_prf = sk + SPX_N;
+    uint8_t* pk = sk + (2 * SPX_N);
+    uint8_t* pub_seed = pk;
+    uint8_t state_seed[SPX_SHA256_OUTPUT_BYTES + 8];
+    uint8_t optrand[SPX_N];
+    uint8_t mhash[SPX_FORS_MSG_BYTES];
+    uint8_t root[SPX_N];
+    uint32_t idx_leaf = 0;
+    uint32_t indices[SPX_FORS_TREES] = { 0, };
+    uint32_t wots_addr[8] = { 0, };
+    uint32_t tree_addr[8] = { 0, };
+    uint64_t i = 0;
+    uint64_t tree = 0;
+    uint64_t sig_index = 0;
+    CPU_hash_initialize_hash_function(pub_seed, sk_seed, state_seed);
+    CPU_randombytes(optrand, SPX_N);
+    CPU_gen_message_random(sig, sk_prf, optrand, m, mlen);
+    CPU_hash_message(mhash, &tree, &idx_leaf, sig + sig_index, pk, m, mlen); sig_index += SPX_N;
+    CPU_set_tree_addr(wots_addr, tree);
+    CPU_set_keypair_addr(wots_addr, idx_leaf);
+    CPU_message_to_indices(indices, mhash);
+
+    //! GPU FORS Params set
+    uint8_t* gpu_fors_sig = NULL;
+    uint8_t* gpu_root = NULL;
+    uint8_t* gpu_sk_seed = NULL;
+    uint8_t* gpu_pub_seed = NULL;
+    uint8_t* gpu_state_seed = NULL;
+    uint32_t* gpu_wots_addr = NULL;
+    uint32_t* gpu_indices = NULL;
+    uint32_t* gpu_lengths = NULL;
+
+    //! GPU WOTS+ Params set
+    uint8_t* gpu_wots_sig = NULL;
+    uint32_t* gpu_idx_leaf = NULL;
+    uint64_t* gpu_tree = NULL;
+
+    //! GPU FORS Malloc & Memcopy Copy
+    cudaMalloc((void**)&gpu_fors_sig, sizeof(uint8_t) * SPX_FORS_BYTES);
+    cudaMalloc((void**)&gpu_root, SPX_FORS_TREES * sizeof(uint8_t) * SPX_N);
+    cudaMalloc((void**)&gpu_sk_seed, sizeof(uint8_t) * SPX_SK_BYTES);
+    cudaMalloc((void**)&gpu_pub_seed, sizeof(uint8_t) * SPX_PK_BYTES);
+    cudaMalloc((void**)&gpu_state_seed, sizeof(uint8_t) * 40);
+    cudaMalloc((void**)&gpu_wots_addr, sizeof(uint32_t) * 8);
+    cudaMalloc((void**)&gpu_indices, sizeof(uint32_t) * SPX_FORS_TREES);
+    cudaMalloc((void**)&gpu_lengths, sizeof(uint32_t) * SPX_WOTS_LEN * (SPX_D + 1));
+
+    cudaMemcpy(gpu_indices, indices, sizeof(uint32_t) * SPX_FORS_TREES, cudaMemcpyHostToDevice);
+    cudaMemcpy(gpu_sk_seed, sk_seed, sizeof(uint8_t) * SPX_SK_BYTES, cudaMemcpyHostToDevice);
+    cudaMemcpy(gpu_pub_seed, pub_seed, sizeof(uint8_t) * SPX_PK_BYTES, cudaMemcpyHostToDevice);
+    cudaMemcpy(gpu_wots_addr, wots_addr, sizeof(uint32_t) * 8, cudaMemcpyHostToDevice);
+    cudaMemcpy(gpu_state_seed, state_seed, sizeof(uint8_t) * 40, cudaMemcpyHostToDevice);
+
+    //! GPU WOTS+ Malloc & Memory Copy
+    cudaMalloc((void**)&gpu_idx_leaf, sizeof(uint32_t));
+    cudaMalloc((void**)&gpu_tree, sizeof(uint64_t));
+    cudaMalloc((void**)&gpu_wots_sig, SPX_D * (SPX_WOTS_BYTES + SPX_TREE_HEIGHT * SPX_N));
+    cudaMemcpy(gpu_idx_leaf, &idx_leaf, sizeof(uint32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(gpu_tree, &tree, sizeof(uint64_t), cudaMemcpyHostToDevice);
+
+    float elapsed_time_ms = 0.0f;
+    cudaEvent_t start, stop;
+    cudaError_t err;
+
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    for (int i = 0; i < 10000; i++) {
+        fors_sign_latency << <SPX_FORS_TREES, (1 << (SPX_FORS_HEIGHT - 1)) >> > (gpu_fors_sig, gpu_root, gpu_indices, gpu_sk_seed, gpu_pub_seed, gpu_wots_addr, gpu_state_seed, gpu_lengths);
+        cudaMemcpy(sig + sig_index, gpu_fors_sig, SPX_FORS_BYTES, cudaMemcpyDeviceToHost);
+    }
+    cudaEventRecord(stop, 0);
+    cudaDeviceSynchronize();
+    cudaEventSynchronize(start);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed_time_ms, start, stop);
+    elapsed_time_ms /= 10000;
+    printf("FORS signature = %4.2f ms\n", elapsed_time_ms);
+    sig_index = SPX_N + SPX_FORS_BYTES;
+    /////////////////////////////////////////////////////////////////////////////
+    fors_sign_latency << <SPX_FORS_TREES, (1 << (SPX_FORS_HEIGHT - 1)) >> > (gpu_fors_sig, gpu_root, gpu_indices, gpu_sk_seed, gpu_pub_seed, gpu_wots_addr, gpu_state_seed, gpu_lengths);
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    for (int i = 0; i < 10000; i++) {
+        MSS_signature << < SPX_D, SPX_WOTS_LEN * 4 >> > (gpu_lengths + SPX_WOTS_LEN, gpu_wots_sig, gpu_sk_seed, gpu_pub_seed, gpu_state_seed, gpu_idx_leaf, gpu_tree);
+        cudaMemcpy(sig + sig_index, gpu_wots_sig, SPX_D * (SPX_WOTS_BYTES + SPX_TREE_HEIGHT * SPX_N), cudaMemcpyDeviceToHost);
+    }
+    cudaEventRecord(stop, 0);
+    cudaDeviceSynchronize();
+    cudaEventSynchronize(start);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed_time_ms, start, stop);
+    elapsed_time_ms /= 10000;
+    printf("MSS signature = %4.2f ms\n", elapsed_time_ms);
+    /////////////////////////////////////////////////////////////////////////////
+
+    /////////////////////////////////////////////////////////////////////////////
+    fors_sign_latency << <SPX_FORS_TREES, (1 << (SPX_FORS_HEIGHT - 1)) >> > (gpu_fors_sig, gpu_root, gpu_indices, gpu_sk_seed, gpu_pub_seed, gpu_wots_addr, gpu_state_seed, gpu_lengths);
+    MSS_signature << < SPX_D, SPX_WOTS_LEN * 4 >> > (gpu_lengths + SPX_WOTS_LEN, gpu_wots_sig, gpu_sk_seed, gpu_pub_seed, gpu_state_seed, gpu_idx_leaf, gpu_tree);
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    for (int i = 0; i < 10000; i++) {
+        wots_sign << <SPX_D, SPX_WOTS_LEN >> > (gpu_wots_sig, gpu_lengths, gpu_sk_seed, gpu_pub_seed, gpu_state_seed, gpu_idx_leaf, gpu_tree);
+        cudaMemcpy(sig + sig_index, gpu_wots_sig, SPX_D * (SPX_WOTS_BYTES + SPX_TREE_HEIGHT * SPX_N), cudaMemcpyDeviceToHost);
+    }
+    cudaEventRecord(stop, 0);
+    cudaDeviceSynchronize();
+    cudaEventSynchronize(start);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed_time_ms, start, stop);
+    elapsed_time_ms /= 10000;
+    printf("wots_sign = %4.2f ms\n", elapsed_time_ms);
+    /////////////////////////////////////////////////////////////////////////////
+    sig_index = SPX_N;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+    for (int i = 0; i < 10000; i++) {
+        fors_sign_latency << <SPX_FORS_TREES, (1 << (SPX_FORS_HEIGHT - 1)) >> > (gpu_fors_sig, gpu_root, gpu_indices, gpu_sk_seed, gpu_pub_seed, gpu_wots_addr, gpu_state_seed, gpu_lengths);
+        cudaMemcpy(sig + sig_index, gpu_fors_sig, SPX_FORS_BYTES, cudaMemcpyDeviceToHost);
+        sig_index += SPX_FORS_BYTES;
+        MSS_signature << < SPX_D, SPX_WOTS_LEN * 4 >> > (gpu_lengths + SPX_WOTS_LEN, gpu_wots_sig, gpu_sk_seed, gpu_pub_seed, gpu_state_seed, gpu_idx_leaf, gpu_tree);
+        wots_sign << <SPX_D, SPX_WOTS_LEN >> > (gpu_wots_sig, gpu_lengths, gpu_sk_seed, gpu_pub_seed, gpu_state_seed, gpu_idx_leaf, gpu_tree);
+        cudaMemcpy(sig + sig_index, gpu_wots_sig, SPX_D * (SPX_WOTS_BYTES + SPX_TREE_HEIGHT * SPX_N), cudaMemcpyDeviceToHost);
+        sig_index = SPX_N;
+    }
+    cudaEventRecord(stop, 0);
+    cudaDeviceSynchronize();
+    cudaEventSynchronize(start);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed_time_ms, start, stop);
+    elapsed_time_ms /= 10000;
+    printf("SPHINCS+ = %4.2f ms\n", elapsed_time_ms);
+
+
+    cudaFree(gpu_fors_sig);
+    cudaFree(gpu_root);
+    cudaFree(gpu_sk_seed);
+    cudaFree(gpu_pub_seed);
+    cudaFree(gpu_state_seed);
+    cudaFree(gpu_wots_addr);
+    cudaFree(gpu_indices);
+    cudaFree(gpu_lengths);
+    cudaFree(gpu_idx_leaf);
+    cudaFree(gpu_tree);
+    cudaFree(gpu_wots_sig);
+    return 0;
+}
+
 
 __device__ void AES256_keyscheme(uint8_t* userKey, uint32_t* rk) {
     int i = 0;
@@ -1237,62 +1474,124 @@ __global__ void crypto_sign_keypair(uint8_t* iternal_seed, uint8_t* pk, uint8_t*
     sha256_inc_init(iternal_state);
     sha256_inc_block(iternal_state, iternal_block, 1);
 
-    //wots_gen_leaf parallel
+    //wots_gen_pk part
+    //!=================[0 to 3]===================!//
     set_type(wots_addr, SPX_ADDR_TYPE_WOTS);
     set_type(wots_pk_addr, SPX_ADDR_TYPE_WOTSPK);
 
     copy_subtree_addr(wots_addr, top_tree_addr);
     set_keypair_addr(wots_addr, threadIdx.x / SPX_WOTS_LEN);
 
-    //wots_gen_pk part
     set_chain_addr(wots_addr, threadIdx.x % SPX_WOTS_LEN);
     wots_gen_sk(iternal_temp, iternal_sk, wots_addr);
+
     gen_chain(wots_pk + SPX_N * threadIdx.x, iternal_temp, 0, SPX_WOTS_W - 1, iternal_pk, iternal_sk, wots_addr);
     __syncthreads();
 
-    if (threadIdx.x < 8) {
+    if (threadIdx.x < 4) {
         set_keypair_addr(wots_addr, threadIdx.x);
         copy_keypair_addr(wots_pk_addr, wots_addr);
         wots_gen_leaf_thash(shared_stack + SPX_N * threadIdx.x, wots_pk + (SPX_WOTS_LEN * SPX_N * threadIdx.x), iternal_pk, iternal_state, wots_pk_addr);
     }
     __syncthreads();
 
+    //!=================[4 to 7]===================!//
+    set_type(wots_addr, SPX_ADDR_TYPE_WOTS);
+    set_type(wots_pk_addr, SPX_ADDR_TYPE_WOTSPK);
 
-    //! merging process [8 Node -> 4 Node]
+    copy_subtree_addr(wots_addr, top_tree_addr);
+    set_keypair_addr(wots_addr, (threadIdx.x / SPX_WOTS_LEN) + 4);
+
+    set_chain_addr(wots_addr, threadIdx.x % SPX_WOTS_LEN);
+    wots_gen_sk(iternal_temp, iternal_sk, wots_addr);
+
+    gen_chain(wots_pk + SPX_N * threadIdx.x, iternal_temp, 0, SPX_WOTS_W - 1, iternal_pk, iternal_sk, wots_addr);
+    __syncthreads();
+
     if (threadIdx.x < 4) {
-        set_tree_height(top_tree_addr, 1);
-        set_tree_index(top_tree_addr, threadIdx.x);
-        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (2 * SPX_N * threadIdx.x),
-            shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, iternal_pk, top_tree_addr, iternal_state);
+        set_keypair_addr(wots_addr, (threadIdx.x + 4));
+        copy_keypair_addr(wots_pk_addr, wots_addr);
+        wots_gen_leaf_thash(shared_stack + SPX_N * (threadIdx.x + 4), wots_pk + (SPX_WOTS_LEN * SPX_N * (threadIdx.x + 4)), iternal_pk, iternal_state, wots_pk_addr);
+    }
+    __syncthreads();
+    //!=================[8 to 11]===================!//
+    set_type(wots_addr, SPX_ADDR_TYPE_WOTS);
+    set_type(wots_pk_addr, SPX_ADDR_TYPE_WOTSPK);
+
+    copy_subtree_addr(wots_addr, top_tree_addr);
+    set_keypair_addr(wots_addr, (threadIdx.x / SPX_WOTS_LEN) + 8);
+
+    set_chain_addr(wots_addr, threadIdx.x % SPX_WOTS_LEN);
+    wots_gen_sk(iternal_temp, iternal_sk, wots_addr);
+
+    gen_chain(wots_pk + SPX_N * threadIdx.x, iternal_temp, 0, SPX_WOTS_W - 1, iternal_pk, iternal_sk, wots_addr);
+    __syncthreads();
+
+    if (threadIdx.x < 4) {
+        set_keypair_addr(wots_addr, (threadIdx.x + 8));
+        copy_keypair_addr(wots_pk_addr, wots_addr);
+        wots_gen_leaf_thash(shared_stack + SPX_N * (threadIdx.x + 8), wots_pk + (SPX_WOTS_LEN * SPX_N * (threadIdx.x + 8)), iternal_pk, iternal_state, wots_pk_addr);
+    }
+    __syncthreads();
+    //!=================[12 to 15]===================!//
+    set_type(wots_addr, SPX_ADDR_TYPE_WOTS);
+    set_type(wots_pk_addr, SPX_ADDR_TYPE_WOTSPK);
+
+    copy_subtree_addr(wots_addr, top_tree_addr);
+    set_keypair_addr(wots_addr, (threadIdx.x / SPX_WOTS_LEN) + 12);
+
+    set_chain_addr(wots_addr, threadIdx.x % SPX_WOTS_LEN);
+    wots_gen_sk(iternal_temp, iternal_sk, wots_addr);
+
+    gen_chain(wots_pk + SPX_N * threadIdx.x, iternal_temp, 0, SPX_WOTS_W - 1, iternal_pk, iternal_sk, wots_addr);
+    __syncthreads();
+
+    if (threadIdx.x < 4) {
+        set_keypair_addr(wots_addr, (threadIdx.x + 8));
+        copy_keypair_addr(wots_pk_addr, wots_addr);
+        wots_gen_leaf_thash(shared_stack + SPX_N * (threadIdx.x + 12), wots_pk + (SPX_WOTS_LEN * SPX_N * (threadIdx.x + 12)), iternal_pk, iternal_state, wots_pk_addr);
     }
     __syncthreads();
 
-    //! merging process [4 Node -> 2 Node]
-    if (threadIdx.x < 2) {
+    //!=================[root generation]===================!//
+    if (threadIdx.x < 8) {
+        set_tree_height(top_tree_addr, 1);
+        set_tree_index(top_tree_addr, threadIdx.x);
+        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, iternal_pk, top_tree_addr, iternal_state);
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 4) {
         set_tree_height(top_tree_addr, 2);
         set_tree_index(top_tree_addr, threadIdx.x);
-        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x) + SPX_N, shared_stack + (4 * SPX_N * threadIdx.x),
-            shared_stack + (4 * SPX_N * threadIdx.x) + 2 * SPX_N, iternal_pk, top_tree_addr, iternal_state);
+        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (4 * SPX_N * threadIdx.x), shared_stack + (4 * SPX_N * threadIdx.x) + 2 * SPX_N, iternal_pk, top_tree_addr, iternal_state);
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 2) {
+        set_tree_height(top_tree_addr, 3);
+        set_tree_index(top_tree_addr, threadIdx.x);
+        tree_thash_2depth(shared_stack + (2 * SPX_N * threadIdx.x), shared_stack + (4 * SPX_N * threadIdx.x) + SPX_N, shared_stack + (4 * SPX_N * threadIdx.x) + 3 * SPX_N, iternal_pk, top_tree_addr, iternal_state);
+
     }
     __syncthreads();
 
     if (threadIdx.x == 0) {
-        set_tree_height(top_tree_addr, 3);
+        set_tree_height(top_tree_addr, 4);
         set_tree_index(top_tree_addr, 0);
-        tree_thash_2depth(iternal_sk + 3 * SPX_N, shared_stack + SPX_N, shared_stack + (3 * SPX_N), iternal_pk, top_tree_addr, iternal_state);
-
+        tree_thash_2depth(iternal_sk + 3 * SPX_N, shared_stack, shared_stack + (2 * SPX_N), iternal_pk, top_tree_addr, iternal_state);
         for (int i = 0; i < SPX_PK_BYTES; i++)
             pk[i + (blockIdx.x * SPX_PK_BYTES)] = iternal_pk[i];
         for (int i = 0; i < SPX_SK_BYTES; i++)
             sk[i + (blockIdx.x * SPX_SK_BYTES)] = iternal_sk[i];
-        for (int i = 0; i < SPX_SHA256_OUTPUT_BYTES + 8; i++) {
+        for (int i = 0; i < SPX_SHA256_OUTPUT_BYTES + 8; i++)
             state[i + (blockIdx.x * (SPX_SHA256_OUTPUT_BYTES + 8))] = iternal_state[i];
-
-        }
     }
 }
 
 void crypto_sign_keypair_test(int blocksize) {
+    //AES256_CTR_DRBG_struct* info;
+    //memset(&info, 0, sizeof(AES256_CTR_DRBG_struct));
     uint8_t cpu_seed[CRYPTO_SEEDBYTES] = { 0, };
 
     uint8_t* gpu_pk = NULL;
@@ -1302,10 +1601,11 @@ void crypto_sign_keypair_test(int blocksize) {
     AES256_CTR_DRBG_struct* gpu_info = NULL;
     cudaMalloc((void**)&gpu_pk, SPX_PK_BYTES * blocksize);
     cudaMalloc((void**)&gpu_sk, SPX_SK_BYTES * blocksize);
-    cudaMalloc((void**)&gpu_state, (SPX_SHA256_OUTPUT_BYTES + 8) * blocksize);
-    cudaMalloc((void**)&gpu_seed, CRYPTO_SEEDBYTES);
+    cudaMalloc((void**)&gpu_state, SPX_SHA256_OUTPUT_BYTES + 8);
+    cudaMalloc((void**)&gpu_seed, CRYPTO_SEEDBYTES * blocksize);
     cudaMalloc((void**)&gpu_info, sizeof(AES256_CTR_DRBG_struct));
     cudaMemcpy(gpu_seed, cpu_seed, CRYPTO_SEEDBYTES, cudaMemcpyHostToDevice);
+    //cudaMemcpy(gpu_info, info, sizeof(AES256_CTR_DRBG_struct), cudaMemcpyHostToDevice);
 
     float elapsed_time_ms = 0.0f;
     cudaEvent_t start, stop;
@@ -1315,7 +1615,7 @@ void crypto_sign_keypair_test(int blocksize) {
     cudaEventCreate(&stop);
     cudaEventRecord(start, 0);
     for (int i = 0; i < 10000; i++) {
-        crypto_sign_keypair << <blocksize, (1 << (SPX_FULL_HEIGHT / SPX_D))* SPX_WOTS_LEN >> > (gpu_seed, gpu_pk, gpu_sk, gpu_state);
+        crypto_sign_keypair << <blocksize, 4 * SPX_WOTS_LEN >> > (gpu_seed, gpu_pk, gpu_sk, gpu_state);
     }
     cudaEventRecord(stop, 0);
     cudaDeviceSynchronize();
@@ -1323,112 +1623,10 @@ void crypto_sign_keypair_test(int blocksize) {
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&elapsed_time_ms, start, stop);
     elapsed_time_ms /= 10000;
-    printf("sign_keypair = %4.2f ms\n", elapsed_time_ms);
+    //printf("sign_keypair = %4.2f ms\n", elapsed_time_ms);
     elapsed_time_ms = 1000 / elapsed_time_ms;
     elapsed_time_ms = elapsed_time_ms * blocksize;
     printf("sign_keypair = %4.2f ms\n", elapsed_time_ms);
-
-}
-
-int crypto_sign_signature_security_level_3(uint8_t* sig, size_t* siglen, uint8_t* m, size_t mlen, uint8_t* sk) {
-    uint8_t* sk_seed = sk;
-    uint8_t* sk_prf = sk + SPX_N;
-    uint8_t* pk = sk + (2 * SPX_N);
-    uint8_t* pub_seed = pk;
-    uint8_t state_seed[SPX_SHA256_OUTPUT_BYTES + 8];
-    uint8_t optrand[SPX_N];
-    uint8_t mhash[SPX_FORS_MSG_BYTES];
-    uint8_t root[SPX_N];
-    uint32_t idx_leaf = 0;
-    uint32_t indices[SPX_FORS_TREES] = { 0, };
-    uint32_t wots_addr[8] = { 0, };
-    uint32_t tree_addr[8] = { 0, };
-    uint64_t i = 0;
-    uint64_t tree = 0;
-    uint64_t sig_index = 0;
-    CPU_hash_initialize_hash_function(pub_seed, sk_seed, state_seed);
-    CPU_randombytes(optrand, SPX_N);
-    CPU_gen_message_random(sig, sk_prf, optrand, m, mlen);
-    CPU_hash_message(mhash, &tree, &idx_leaf, sig + sig_index, pk, m, mlen); sig_index += SPX_N;
-    CPU_set_tree_addr(wots_addr, tree);
-    CPU_set_keypair_addr(wots_addr, idx_leaf);
-    CPU_message_to_indices(indices, mhash);
-
-    //! GPU FORS Params set
-    uint8_t* gpu_fors_sig = NULL;
-    uint8_t* gpu_root = NULL;
-    uint8_t* gpu_sk_seed = NULL;
-    uint8_t* gpu_pub_seed = NULL;
-    uint8_t* gpu_state_seed = NULL;
-    uint32_t* gpu_wots_addr = NULL;
-    uint32_t* gpu_indices = NULL;
-    uint32_t* gpu_lengths = NULL;
-
-    //! GPU WOTS+ Params set
-    uint8_t* gpu_wots_sig = NULL;
-    uint32_t* gpu_idx_leaf = NULL;
-    uint64_t* gpu_tree = NULL;
-
-    //! GPU FORS Malloc & Memcopy Copy
-    cudaMalloc((void**)&gpu_fors_sig, sizeof(uint8_t) * SPX_FORS_BYTES);
-    cudaMalloc((void**)&gpu_root, SPX_FORS_TREES * sizeof(uint8_t) * SPX_N);
-    cudaMalloc((void**)&gpu_sk_seed, sizeof(uint8_t) * SPX_SK_BYTES);
-    cudaMalloc((void**)&gpu_pub_seed, sizeof(uint8_t) * SPX_PK_BYTES);
-    cudaMalloc((void**)&gpu_state_seed, sizeof(uint8_t) * 40);
-    cudaMalloc((void**)&gpu_wots_addr, sizeof(uint32_t) * 8);
-    cudaMalloc((void**)&gpu_indices, sizeof(uint32_t) * SPX_FORS_TREES);
-    cudaMalloc((void**)&gpu_lengths, sizeof(uint32_t) * SPX_WOTS_LEN * (SPX_D + 1));
-
-    cudaMemcpy(gpu_indices, indices, sizeof(uint32_t) * SPX_FORS_TREES, cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_sk_seed, sk_seed, sizeof(uint8_t) * SPX_SK_BYTES, cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_pub_seed, pub_seed, sizeof(uint8_t) * SPX_PK_BYTES, cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_wots_addr, wots_addr, sizeof(uint32_t) * 8, cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_state_seed, state_seed, sizeof(uint8_t) * 40, cudaMemcpyHostToDevice);
-
-    //! GPU WOTS+ Malloc & Memory Copy
-    cudaMalloc((void**)&gpu_idx_leaf, sizeof(uint32_t));
-    cudaMalloc((void**)&gpu_tree, sizeof(uint64_t));
-    cudaMalloc((void**)&gpu_wots_sig, SPX_D * (SPX_WOTS_BYTES + SPX_TREE_HEIGHT * SPX_N));
-    cudaMemcpy(gpu_idx_leaf, &idx_leaf, sizeof(uint32_t), cudaMemcpyHostToDevice);
-    cudaMemcpy(gpu_tree, &tree, sizeof(uint64_t), cudaMemcpyHostToDevice);
-
-    float elapsed_time_ms = 0.0f;
-    cudaEvent_t start, stop;
-    cudaError_t err;
-
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start, 0);
-    for (int i = 0; i < 10000; i++) {
-        fors_sign_latency << <SPX_FORS_TREES, (1 << SPX_FORS_HEIGHT) >> > (gpu_fors_sig, gpu_root, gpu_indices, gpu_sk_seed, gpu_pub_seed, gpu_wots_addr, gpu_state_seed, gpu_lengths);
-        MSS_signature << < SPX_D, SPX_WOTS_LEN* (1 << (SPX_FULL_HEIGHT / SPX_D)) >> > (gpu_lengths + SPX_WOTS_LEN, gpu_wots_sig, gpu_sk_seed, gpu_pub_seed, gpu_state_seed, gpu_idx_leaf, gpu_tree);
-        wots_sign << <SPX_D, SPX_WOTS_LEN >> > (gpu_wots_sig, gpu_lengths, gpu_sk_seed, gpu_pub_seed, gpu_state_seed, gpu_idx_leaf, gpu_tree);
-        cudaMemcpy(sig + sig_index, gpu_fors_sig, SPX_FORS_BYTES, cudaMemcpyDeviceToHost);
-        sig_index += SPX_FORS_BYTES;
-        cudaMemcpy(sig + sig_index, gpu_wots_sig, SPX_D * (SPX_WOTS_BYTES + SPX_TREE_HEIGHT * SPX_N), cudaMemcpyDeviceToHost);
-        sig_index = SPX_N;
-    }
-    cudaEventRecord(stop, 0);
-    cudaDeviceSynchronize();
-    cudaEventSynchronize(start);
-    cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&elapsed_time_ms, start, stop);
-    elapsed_time_ms /= 10000;
-    printf("SPHINCS+ = %4.2f ms\n", elapsed_time_ms);
-
-
-    cudaFree(gpu_fors_sig);
-    cudaFree(gpu_root);
-    cudaFree(gpu_sk_seed);
-    cudaFree(gpu_pub_seed);
-    cudaFree(gpu_state_seed);
-    cudaFree(gpu_wots_addr);
-    cudaFree(gpu_indices);
-    cudaFree(gpu_lengths);
-    cudaFree(gpu_idx_leaf);
-    cudaFree(gpu_tree);
-    cudaFree(gpu_wots_sig);
-    return 0;
 }
 
 int main() {
@@ -1443,8 +1641,8 @@ int main() {
         m[i] = i;
         sk[i] = i * i - i;
     }
-
     uint32_t msgNum[10] = { 1, 2, 4, 8, 16, 32, 64, 128, 256, 512 };
-    for (int i = 0; i < 1; i++)
+    for (int i = 0; i < 10; i++)
         crypto_sign_keypair_test(msgNum[i]);
+    //crypto_sign_signature_security_level_5(sig, &siglen, m, SPX_SK_BYTES, sk);
 }
